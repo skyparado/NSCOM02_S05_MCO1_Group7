@@ -13,33 +13,7 @@ def checksum(string):
     countTo = (len(string) // 2) * 2
     count = 0
     while count < countTo:
-        thisVal = ord(string[count+1]) * 256 + ord(string[count])
-        csum = csum + thisVal
-        csum = csum & 0xffffffff
-        count = count + 2
-    if countTo < len(string):
-        csum = csum + ord(string[len(string) - 1])
-        csum = csum & 0xffffffff
-    csum = (csum >> 16) + (csum & 0xffff)
-    csum = csum + (csum >> 16)
-    answer = ~csum
-    answer = answer & 0xffff
-    answer = answer >> 8 | (answer << 8 & 0xff00)
-    return answer
-
-# Makes it a string so its a valid check sum, this entire thing is added/double check if this allowed...
-import ast
-def checksum(string):
-    if isinstance(string, str):
-        if string.startswith("b'") or string.startswith('b"'):
-            string = ast.literal_eval(string)
-        else:
-            string = string.encode('latin-1')
-    csum = 0
-    countTo = (len(string) // 2) * 2
-    count = 0
-    while count < countTo:
-        thisVal = string[count + 1] * 256 + string[count]
+        thisVal = string[count+1] * 256 + string[count]
         csum = csum + thisVal
         csum = csum & 0xffffffff
         count = count + 2
@@ -53,7 +27,7 @@ def checksum(string):
     answer = answer >> 8 | (answer << 8 & 0xff00)
     return answer
 
-def receiveOnePing(mySocket, ID, timeout, destAddr):
+def receiveOnePing(mySocket, ID, seq, timeout, destAddr):
     timeLeft = timeout
     while 1:
         startedSelect = time.time()
@@ -64,11 +38,11 @@ def receiveOnePing(mySocket, ID, timeout, destAddr):
         timeReceived = time.time()
         recPacket, addr = mySocket.recvfrom(1024)
         #Fill in start
-        #Fetch the ICMP header from the IP packet
+        # the ICMP header that sits after the 20-byte IP header
         icmpHeader = recPacket[20:28]
         icmpType, code, checksum_val, packetID, sequence = struct.unpack("bbHHh", icmpHeader)
 
-        # BONUS 2: Parse and display ICMP error codes when Echo Reply is not received
+        # the error messages that replace a missing Echo Reply (BONUS 2)
         if icmpType == 3:  # Destination Unreachable
             errorCodes = {
                 0: "Destination Network Unreachable",
@@ -77,10 +51,11 @@ def receiveOnePing(mySocket, ID, timeout, destAddr):
                 3: "Destination Port Unreachable",
             }
             return errorCodes.get(code, "Destination Unreachable (code %d)" % code)
-        elif icmpType == 11:  # Time Exceeded (TTL Expired)
+        elif icmpType == 11:  # TTL expired
             return "TTL Expired in Transit"
 
-        if packetID == ID:
+        # the reply that matches our request by ID and sequence, giving the RTT
+        if packetID == ID and sequence == seq:
             bytesInDouble = struct.calcsize("d")
             timeSent = struct.unpack("d", recPacket[28:28 + bytesInDouble])[0]
             return timeReceived - timeSent
@@ -89,77 +64,97 @@ def receiveOnePing(mySocket, ID, timeout, destAddr):
         if timeLeft <= 0:
             return "Request timed out."
 
-def sendOnePing(mySocket, destAddr, ID):
+def sendOnePing(mySocket, destAddr, ID, seq):
     # Header is type (8), code (8), checksum (16), id (16), sequence (16)
     myChecksum = 0
-    # Make a dummy header with a 0 checksum
-    # struct -- Interpret strings as packed binary data
-    header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, myChecksum, ID, 1)
+    # the dummy header with a 0 checksum
+    header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, myChecksum, ID, seq)
+    # the timestamp that becomes the payload
     data = struct.pack("d", time.time())
-    # Calculate the checksum on the data and the dummy header.
-    myChecksum = checksum(str(header + data))
-    # Get the right checksum, and put in the header
+    # the checksum over header and data
+    myChecksum = checksum(header + data)
     if sys.platform == 'darwin':
-        # Convert 16-bit integers from host to network byte order
         myChecksum = htons(myChecksum) & 0xffff
     else:
         myChecksum = htons(myChecksum)
-    header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, myChecksum, ID, 1)
+    # the real header with the correct checksum
+    header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, myChecksum, ID, seq)
     packet = header + data
-    mySocket.sendto(packet, (destAddr, 1)) # AF_INET address must be tuple, not str
-    # Both LISTS and TUPLES consist of a number of objects
-    # which can be referenced by their position number within the object.
+    mySocket.sendto(packet, (destAddr, 1))
 
-def doOnePing(destAddr, timeout):
+def doOnePing(destAddr, timeout, ttl=None):
     icmp = getprotobyname("icmp")
-    # SOCK_RAW is a powerful socket type. For more details: http://sockraw.org/papers/sock_raw
     #Fill in start
-    #create socket
+    # the raw socket that speaks ICMP
     mySocket = socket(AF_INET, SOCK_RAW, icmp)
     #Fill in end
-    myID = os.getpid() & 0xFFFF # Return the current process i
-    #Fill in start
-    #send a single ping using the socket, dst addr and ID
-    sendOnePing(mySocket, destAddr, myID)
-    #add delay using timeout
-    delay = receiveOnePing(mySocket, myID, timeout, destAddr)
-    #close socket
-    mySocket.close()
-    # Track sequence number for per-packet output (spec: print seq + RTT in ms)
-    # Also accumulate stats for BONUS 1
+    # the low TTL that makes a router reply with a Time Exceeded error (BONUS 2)
+    if ttl is not None:
+        mySocket.setsockopt(IPPROTO_IP, IP_TTL, ttl)
+    myID = os.getpid() & 0xFFFF  # the ID that tags our packets
+    # the counters that survive across pings (seq + BONUS 1 stats)
     if not hasattr(doOnePing, 'seq'):
         doOnePing.seq = 0
         doOnePing.sent = 0
         doOnePing.rtts = []
-    doOnePing.seq = (doOnePing.seq + 1) & 0xFFFF
+    # the sequence number that increases for every packet
+    doOnePing.seq = (doOnePing.seq + 1) & 0x7FFF
+    seq = doOnePing.seq
     doOnePing.sent += 1
+    #Fill in start
+    # the request we send and the reply we wait for
+    sendOnePing(mySocket, destAddr, myID, seq)
+    delay = receiveOnePing(mySocket, myID, seq, timeout, destAddr)
+    mySocket.close()
     if isinstance(delay, float):
         rttMs = delay * 1000
         doOnePing.rtts.append(rttMs)
-        delay = "seq=%d RTT=%.3f ms" % (doOnePing.seq, rttMs)
+        delay = "seq=%d RTT=%.3f ms" % (seq, rttMs)
     else:
-        delay = "seq=%d %s" % (doOnePing.seq, delay)
+        delay = "seq=%d %s" % (seq, delay)
     #Fill in end
     return delay
 
-def ping(host, timeout=1):
-    # timeout=1 means: If one second goes by without a reply from the server,
-    # the client assumes that either the client's ping or the server's pong is lost
+def ping(host, timeout=1, ttl=None):
     dest = gethostbyname(host)
     print("Pinging " + dest + " using Python:")
     print("")
-    # Send ping requests to a server separated by approximately one second
+    # the loop that pings once per second
     while 1 :
-        delay = doOnePing(dest, timeout)
+        delay = doOnePing(dest, timeout, ttl)
         print(delay)
-        time.sleep(1)# one second
+        time.sleep(1)
     return delay
 
-# BONUS 1: RTT Summary Stats — wrap call to catch Ctrl+C and print min/max/avg + packet loss
-# timeout=2 to match spec requirement of 2000 ms before assuming packet is lost
 if __name__ == "__main__":
+    # the menu that picks the host to ping
+    presets = {
+        "1": ("Localhost", "127.0.0.1"),
+        "2": ("NASA (USA)", "www.nasa.gov"),
+        "3": ("Yahoo (Singapore)", "sg.yahoo.com"),
+        "4": ("ABC (Australia)", "www.abc.net.au"),
+    }
+    print("Select a host to ping:")
+    for key in ("1", "2", "3", "4"):
+        print("  %s. %s (%s)" % (key, presets[key][0], presets[key][1]))
+    print("  5. Enter a host manually")
+    print("  6. Demonstrate ICMP error (TTL Expired via TTL=1)")
+    choice = input("Choice: ").strip()
+    ttl = None
+    if choice in presets:
+        host = presets[choice][1]
+    elif choice == "5":
+        host = input("Enter host or IP: ").strip()
+    elif choice == "6":
+        host = input("Enter a distant host or IP [google.com]: ").strip() or "google.com"
+        ttl = 1  # the TTL that expires at the first router and returns Type 11
+    else:
+        print("Invalid choice, defaulting to localhost.")
+        host = "127.0.0.1"
+
+    # the stats printed on Ctrl+C (BONUS 1); timeout=2 is the 2000 ms loss limit
     try:
-        ping("127.0.0.1", timeout=2)
+        ping(host, timeout=2, ttl=ttl)
     except KeyboardInterrupt:
         print("\n--- Ping Statistics ---")
         sent = doOnePing.sent if hasattr(doOnePing, 'sent') else 0
