@@ -42,17 +42,26 @@ def receiveOnePing(mySocket, ID, seq, timeout, destAddr):
         icmpHeader = recPacket[20:28]
         icmpType, code, checksum_val, packetID, sequence = struct.unpack("bbHHh", icmpHeader)
 
-        # the error messages that replace a missing Echo Reply (BONUS 2)
-        if icmpType == 3:  # Destination Unreachable
-            errorCodes = {
-                0: "Destination Network Unreachable",
-                1: "Destination Host Unreachable",
-                2: "Destination Protocol Unreachable",
-                3: "Destination Port Unreachable",
-            }
-            return errorCodes.get(code, "Destination Unreachable (code %d)" % code)
-        elif icmpType == 11:  # TTL expired
-            return "TTL Expired in Transit"
+        # === BONUS 2 START: ICMP error parsing ===
+        # the error messages that replace a missing Echo Reply
+        # ponytail: raw ICMP sockets see every ICMP packet on the host, so we
+        # match the ID/seq embedded in the original datagram the router
+        # quoted back, not just the outer error header, to avoid blaming
+        # this ping for someone else's unreachable/expired packet.
+        if icmpType in (3, 11) and len(recPacket) >= 56:
+            origID, origSeq = struct.unpack("bbHHh", recPacket[48:56])[3:5]
+            if origID == ID and origSeq == seq:
+                if icmpType == 3:  # Destination Unreachable
+                    errorCodes = {
+                        0: "Destination Network Unreachable",
+                        1: "Destination Host Unreachable",
+                        2: "Destination Protocol Unreachable",
+                        3: "Destination Port Unreachable",
+                    }
+                    return errorCodes.get(code, "Destination Unreachable (code %d)" % code)
+                else:  # TTL expired
+                    return "TTL Expired in Transit"
+        # === BONUS 2 END ===
 
         # the reply that matches our request by ID and sequence, giving the RTT
         if packetID == ID and sequence == seq:
@@ -88,11 +97,12 @@ def doOnePing(destAddr, timeout, ttl=None):
     # the raw socket that speaks ICMP
     mySocket = socket(AF_INET, SOCK_RAW, icmp)
     #Fill in end
-    # the low TTL that makes a router reply with a Time Exceeded error (BONUS 2)
+    # BONUS 2: the low TTL that makes a router reply with a Time Exceeded error
     if ttl is not None:
         mySocket.setsockopt(IPPROTO_IP, IP_TTL, ttl)
     myID = os.getpid() & 0xFFFF  # the ID that tags our packets
-    # the counters that survive across pings (seq + BONUS 1 stats)
+    # === BONUS 1 START: RTT stats bookkeeping ===
+    # the counters that survive across pings (seq + stats)
     if not hasattr(doOnePing, 'seq'):
         doOnePing.seq = 0
         doOnePing.sent = 0
@@ -101,6 +111,7 @@ def doOnePing(destAddr, timeout, ttl=None):
     doOnePing.seq = (doOnePing.seq + 1) & 0x7FFF
     seq = doOnePing.seq
     doOnePing.sent += 1
+    # === BONUS 1 END ===
     #Fill in start
     # the request we send and the reply we wait for
     sendOnePing(mySocket, destAddr, myID, seq)
@@ -108,7 +119,7 @@ def doOnePing(destAddr, timeout, ttl=None):
     mySocket.close()
     if isinstance(delay, float):
         rttMs = delay * 1000
-        doOnePing.rtts.append(rttMs)
+        doOnePing.rtts.append(rttMs)  # BONUS 1: record this RTT for the end-of-run summary
         delay = "seq=%d RTT=%.3f ms" % (seq, rttMs)
     else:
         delay = "seq=%d %s" % (seq, delay)
@@ -138,7 +149,7 @@ if __name__ == "__main__":
     for key in ("1", "2", "3", "4"):
         print("  %s. %s (%s)" % (key, presets[key][0], presets[key][1]))
     print("  5. Enter a host manually")
-    print("  6. Demonstrate ICMP error (TTL Expired via TTL=1)")
+    print("  6. Demonstrate ICMP error (TTL Expired via TTL=1)")  # BONUS 2 demo
     choice = input("Choice: ").strip()
     ttl = None
     if choice in presets:
@@ -147,15 +158,16 @@ if __name__ == "__main__":
         host = input("Enter host or IP: ").strip()
     elif choice == "6":
         host = input("Enter a distant host or IP [google.com]: ").strip() or "google.com"
-        ttl = 1  # the TTL that expires at the first router and returns Type 11
+        ttl = 1  # BONUS 2: the TTL that expires at the first router and returns Type 11
     else:
         print("Invalid choice, defaulting to localhost.")
         host = "127.0.0.1"
 
-    # the stats printed on Ctrl+C (BONUS 1); timeout=2 is the 2000 ms loss limit
+    # timeout=2 is the 2000 ms loss limit from the spec
     try:
         ping(host, timeout=2, ttl=ttl)
     except KeyboardInterrupt:
+        # === BONUS 1 START: summary stats printed on Ctrl+C ===
         print("\n--- Ping Statistics ---")
         sent = doOnePing.sent if hasattr(doOnePing, 'sent') else 0
         rtts = doOnePing.rtts if hasattr(doOnePing, 'rtts') else []
@@ -165,3 +177,4 @@ if __name__ == "__main__":
         if rtts:
             print("RTT min=%.3f ms / avg=%.3f ms / max=%.3f ms" % (
                 min(rtts), sum(rtts) / len(rtts), max(rtts)))
+        # === BONUS 1 END ===
